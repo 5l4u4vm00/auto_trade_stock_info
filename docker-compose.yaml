@@ -1,0 +1,22 @@
+services:
+  scheduler:
+    build:
+      context: .
+      args:
+        CLAUDE_INSTALL_URL: ${CLAUDE_INSTALL_URL}
+    container_name: auto-trade-scheduler
+    restart: unless-stopped
+    working_dir: /app
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      TZ: ${TZ:-Asia/Taipei}
+      PYTHONUNBUFFERED: "1"
+    command: ["python", "-u", "scheduler/main.py"]
+    volumes:
+      - ./scheduler/config.yaml:/app/scheduler/config.yaml:ro
+      - ./logs:/app/logs
+      - ./outputs:/app/outputs
+      - ./strategy:/app/strategy
+      - ./.claude:/app/.claude:ro
+      - ${HOME}/.claude:/root/.claude
+      - ${HOME}/.codex:/root/.codex
