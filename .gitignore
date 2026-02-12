@@ -17,3 +17,5 @@ outputs/*.md
 
 # OS files
 .DS_Store
+
+.env
