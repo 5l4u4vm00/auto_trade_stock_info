@@ -1,0 +1,45 @@
+email:
+  smtp_host: "smtp.gmail.com"
+  smtp_port: 587
+  sender: "your_email@gmail.com"
+  password: "app_password_here" # Gmail 應用程式密碼
+  recipient: "target@example.com"
+
+ai:
+  provider: "codex" # claude / codex（改為 custom 可啟用 codex）
+  timeout_minutes:
+    news: 10
+    daily: 15
+  retry:
+    max_attempts: 2 # 含第一次，總嘗試次數
+    backoff_seconds: 3
+  claude:
+    command: "claude"
+    mode: "argv" # argv / stdin
+    prompt_arg: "-p"
+    extra_args:
+      - "--allowedTools"
+      - "Bash,Read,Write,Glob,Grep,WebSearch,WebFetch"
+  codex:
+    command_template: "codex exec -m gpt-5-codex --full-auto --skip-git-repo-check"
+    mode: "stdin" # argv / stdin（codex 建議用 stdin 傳 prompt）
+    shell: true
+
+trading_preferences:
+  risk_level: "moderate" # aggressive / moderate / conservative
+  capital: 1000000 # 可用資金（台幣）
+  trading_period: "short" # day_trade / short / swing
+  holdings: [] # 目前持股，例如 ["2330", "2317"]
+  focus_sectors: [] # 關注產業，例如 ["半導體", "AI"]
+
+schedule:
+  news_picker_day: "sun" # 新聞選股在週日
+  news_picker_time: "00:00"
+  daily_analysis_time: "08:00"
+  monitor_start: "09:00"
+  monitor_end: "13:30"
+  monitor_interval_minutes: 30
+
+signal_threshold:
+  min_bullish_signals: 3 # 觸發買入提醒的最低多頭信號數
+  min_bearish_signals: 3 # 觸發賣出提醒的最低空頭信號數
