@@ -6,7 +6,7 @@ email:
   recipient: "target@example.com"
 
 ai:
-  provider: "codex" # claude / codex（改為 custom 可啟用 codex）
+  provider: "codex" # claude / codex
   timeout_minutes:
     news: 10
     daily: 15
@@ -21,9 +21,22 @@ ai:
       - "--allowedTools"
       - "Bash,Read,Write,Glob,Grep,WebSearch,WebFetch"
   codex:
-    command_template: "codex exec -m gpt-5-codex --full-auto --skip-git-repo-check"
+    command_template: "codex exec -m gpt-5.3-codex --full-auto --skip-git-repo-check"
     mode: "stdin" # argv / stdin（codex 建議用 stdin 傳 prompt）
     shell: true
+  # 2026-02-13 調整方式: 新增 skill 強制模式，缺少必要 skill 時任務直接失敗。
+  skill_enforcement:
+    enabled: true
+    mode: "strict" # strict / warn
+    repo_skill_roots:
+      - ".claude/skills"
+      - ".codex/skills"
+    task_skill_map:
+      news: "news-stock-picker"
+      daily: "tw-stock-analyzer"
+    provider_home_map:
+      claude: "/root/.claude/skills"
+      codex: "/root/.codex/skills"
 
 trading_preferences:
   risk_level: "moderate" # aggressive / moderate / conservative

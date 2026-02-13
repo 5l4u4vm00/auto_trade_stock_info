@@ -7,7 +7,7 @@
 - 每週新聞選股：每週固定時間產生 `strategy/news_strategy_*.md`
 - 每日交易計畫：交易日上午產生 `outputs/trading_plan_*.md`
 - 盤中監控警報：交易時段內定期分析推薦標的並寄送買賣提醒
-- Provider 可切換：支援 `claude` 與 `custom` CLI
+- Provider 可切換：支援 `claude` 與 `codex` CLI
 
 ## 專案結構
 
@@ -21,7 +21,9 @@
 │   ├── trading_calendar.py   # 台股交易日判斷
 │   ├── config.yaml           # 系統設定
 │   ├── requirements.txt      # Python 套件
+│   ├── scripts/              # 內建個股分析腳本
 │   └── tests/                # 單元測試
+├── docker/                   # container 啟動初始化
 ├── strategy/                 # 新聞選股報告輸出
 ├── outputs/                  # 每日交易計畫輸出（執行後產生）
 └── logs/                     # 排程日誌
@@ -51,6 +53,104 @@ mkdir -p logs outputs strategy
 3. `trading_preferences`：資金、風險偏好、交易週期、持股、關注產業
 4. `schedule`：三個排程任務時間
 5. `signal_threshold`：盤中警報觸發門檻
+6. `ai.skill_enforcement`：強制任務使用 skill 的驗證與同步策略
+
+## Skill 強制模式
+
+2026-02-13 調整方式：`news` / `daily` 任務啟用 skill preflight，缺少必要 skill 時會直接失敗（`strict`）。
+
+設定位置：`scheduler/config.yaml` -> `ai.skill_enforcement`
+
+```yaml
+ai:
+  skill_enforcement:
+    enabled: true
+    mode: "strict"
+    repo_skill_roots:
+      - ".claude/skills"
+      - ".codex/skills"
+    task_skill_map:
+      news: "news-stock-picker"
+      daily: "tw-stock-analyzer"
+    provider_home_map:
+      claude: "/root/.claude/skills"
+      codex: "/root/.codex/skills"
+```
+
+說明：
+
+- `strict`：缺少 task 對應 skill、skill 同步失敗時，任務立即失敗
+- `warn`：記錄警告後仍繼續執行一般 prompt
+- 任務執行前會先檢查 skill，並將可用 skill 同步到 provider home（同名覆蓋）
+- 2026-02-13 調整方式：若 `repo_skill_roots` 找不到必要 skill，會自動 fallback 到 `provider_home_map` 路徑查找
+- 若在非 root 本機執行，且 provider home 設為 `/root/...`，系統會自動映射到目前使用者 home 路徑
+
+## Docker Compose（無 host bind）
+
+`docker-compose.yaml` 已改為容器內建設定與 named volumes，不再掛載：
+
+- `./scheduler/config.yaml`
+- `./logs`、`./outputs`、`./strategy`
+- `./.claude`、`${HOME}/.claude`、`${HOME}/.codex`
+
+`scheduler/config.yaml` 會隨 image 打包，修改設定後需重新 build。
+
+2026-02-13 調整方式：映像會內建 `.claude/`、`.codex/`，skill 同步發生在任務執行前（非容器啟動時）。
+
+啟動方式：
+
+```bash
+docker compose up -d --build
+```
+
+### claude / codex 家目錄注入（可選）
+
+若要在容器內保留 `~/.claude` 或 `~/.codex`（例如 provider 登入狀態），可先在主機打包並 base64：
+
+```bash
+tar -czf - -C "${HOME}" .claude/.credentials.json | base64 -w0
+tar -czf - -C "${HOME}" .codex/auth.json | base64 -w0
+```
+
+再放入 `.env`：
+
+```bash
+CLAUDE_HOME_TGZ_B64=<上面輸出的單行字串>
+CODEX_HOME_TGZ_B64=<上面輸出的單行字串>
+```
+
+未設定這兩個變數時，容器仍可啟動，只是不會還原對應 home 目錄資料。
+
+### 容器內 terminal 操作（保留 `docker exec`）
+
+2026-02-13 調整方式：`scheduler` 主容器保留互動終端，可在不停止排程下進入容器操作。
+
+```bash
+# 建議用 compose service 名稱進入
+docker compose exec scheduler bash
+
+# 或直接用容器名稱進入
+docker exec -it auto-trade-scheduler bash
+```
+
+若映像調整後未包含 `bash`，可改用 `sh`：
+
+```bash
+docker compose exec scheduler sh
+docker exec -it auto-trade-scheduler sh
+```
+
+若容器尚未啟動，先執行：
+
+```bash
+docker compose up -d --build
+```
+
+一次性檢查建議用 `bash -lc`，避免影響主進程：
+
+```bash
+docker compose exec scheduler bash -lc "whoami && pwd"
+```
 
 ## 執行方式
 
@@ -90,4 +190,86 @@ python3 -m unittest discover -s scheduler/tests -p "test_*.py"
 
 - `scheduler/trading_calendar.py` 的假日清單目前為手動維護（含 2025、2026），每年需更新。
 - `daily` / `news` 任務除了 CLI 回傳成功，還要求新報告檔案實際產生才視為成功。
-- 盤中監控會呼叫 `.claude/skills/single-stock-analyzer/scripts/analyze_single_stock.py`，請確保該檔案存在且可執行。
+- 盤中監控會呼叫 `scheduler/scripts/analyze_single_stock.py`，該腳本已隨專案打包。
+
+# Scheduler AI Provider 設定
+
+本專案排程系統使用 `scheduler/ai_runner.py` 呼叫 AI CLI，透過 `scheduler/config.yaml` 的 `ai` 區塊切換 provider。
+
+## 支援 provider
+
+- `claude`：內建設定，預設可直接使用
+- `codex`：透過 `command_template` 呼叫 Codex CLI
+
+## 設定範例
+
+```yaml
+ai:
+  provider: "claude"
+  timeout_minutes:
+    news: 10
+    daily: 15
+  retry:
+    max_attempts: 2
+    backoff_seconds: 3
+  claude:
+    command: "claude"
+    mode: "argv"
+    prompt_arg: "-p"
+    extra_args:
+      - "--allowedTools"
+      - "Bash,Read,Write,Glob,Grep,WebSearch,WebFetch"
+```
+
+## `codex` provider（argv）
+
+`command_template` 可使用 `{prompt}` 佔位符：
+
+```yaml
+ai:
+  provider: "codex"
+  codex:
+    command_template: "my_ai_cli --model x1 --prompt '{prompt}'"
+    mode: "argv"
+    shell: true
+```
+
+## `codex` provider（stdin）
+
+將 prompt 透過標準輸入傳遞：
+
+```yaml
+ai:
+  provider: "codex"
+  codex:
+    command_template: "my_ai_cli --model x1"
+    mode: "stdin"
+    shell: true
+```
+
+## `codex` provider（Codex CLI 範例）
+
+使用 Codex CLI，並在指令中指定版本：
+
+```yaml
+ai:
+  provider: "codex"
+  codex:
+    command_template: "codex exec -m gpt-5-codex --full-auto --skip-git-repo-check"
+    mode: "stdin"
+    shell: true
+```
+
+說明：
+
+- `-m gpt-5-codex`：指定 Codex 模型版本
+- `mode: "stdin"`：由 `ai_runner` 將任務 prompt 透過 stdin 傳給 `codex exec`
+- 若要切回 Claude，將 `provider` 改回 `"claude"` 即可
+
+## 成功判定規則
+
+- `news` 任務：CLI return code = 0 且有新產生 `strategy/news_strategy_*.md`
+- `daily` 任務：CLI return code = 0 且有新產生 `outputs/trading_plan_*.md`
+- 若只成功執行 CLI、但未產生檔案，任務仍視為失敗
+
+# CMD ["python", "-u", "scheduler/main.py"]

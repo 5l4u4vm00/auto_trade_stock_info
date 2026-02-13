@@ -13,6 +13,9 @@ import os
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+SINGLE_STOCK_SCRIPT_PATH = os.path.join(
+    PROJECT_ROOT, "scheduler", "scripts", "analyze_single_stock.py"
+)
 
 ALLOWED_TOOLS = "Bash,Read,Write,Glob,Grep,WebSearch,WebFetch"
 
@@ -131,11 +134,13 @@ def run_single_stock_analysis(stock_code):
     Returns:
         tuple: (success: bool, stdout: str, stderr: str)
     """
-    script_path = os.path.join(
-        PROJECT_ROOT,
-        '.claude', 'skills', 'single-stock-analyzer', 'scripts',
-        'analyze_single_stock.py'
-    )
+    # 2026-02-13 調整方式: 腳本改由 scheduler/scripts 內建，不再依賴 .claude bind mount。
+    script_path = SINGLE_STOCK_SCRIPT_PATH
+
+    if not os.path.exists(script_path):
+        err = f"找不到個股分析腳本: {script_path}"
+        logger.error(err)
+        return False, "", err
 
     cmd = ["python3", script_path, stock_code]
     logger.debug(f"執行個股分析: {stock_code}")

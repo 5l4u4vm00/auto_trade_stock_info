@@ -7,6 +7,7 @@ import glob
 import logging
 import os
 import shlex
+import shutil
 import subprocess
 import time
 from datetime import date
@@ -16,6 +17,9 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 STRATEGY_DIR = os.path.join(PROJECT_ROOT, "strategy")
 OUTPUTS_DIR = os.path.join(PROJECT_ROOT, "outputs")
+SINGLE_STOCK_SCRIPT_PATH = os.path.join(
+    PROJECT_ROOT, "scheduler", "scripts", "analyze_single_stock.py"
+)
 
 DEFAULT_ALLOWED_TOOLS = "Bash,Read,Write,Glob,Grep,WebSearch,WebFetch"
 
@@ -35,10 +39,26 @@ DEFAULT_AI_CONFIG = {
         "prompt_arg": "-p",
         "extra_args": ["--allowedTools", DEFAULT_ALLOWED_TOOLS],
     },
-    "custom": {
+    "codex": {
         "command_template": "",
         "mode": "argv",
         "shell": True,
+    },
+    "skill_enforcement": {
+        "enabled": True,
+        "mode": "strict",  # strict / warn
+        "repo_skill_roots": [
+            "/root/.claude/skills",
+            "/root/.codex/skills",
+        ],
+        "task_skill_map": {
+            "news": "news-stock-picker",
+            "daily": "tw-stock-analyzer",
+        },
+        "provider_home_map": {
+            "claude": "/root/.claude/skills",
+            "codex": "/root/.codex/skills",
+        },
     },
 }
 
@@ -81,6 +101,256 @@ def _task_timeout(ai_cfg, task_name, fallback_minutes):
     return fallback_minutes
 
 
+def _resolve_skill_config(ai_cfg):
+    skill_cfg = ai_cfg.get("skill_enforcement", {})
+    return _deep_merge(DEFAULT_AI_CONFIG["skill_enforcement"], skill_cfg)
+
+
+def _is_strict_skill_mode(skill_cfg):
+    mode = str(skill_cfg.get("mode", "strict")).strip().lower()
+    return mode != "warn"
+
+
+def _iter_repo_skill_roots(skill_cfg, provider):
+    roots = skill_cfg.get("repo_skill_roots", [])
+    if not isinstance(roots, list):
+        return []
+
+    preferred_root = f".{provider}/skills"
+    resolved_roots = []
+
+    for root in roots:
+        root_path = str(root).strip()
+        if not root_path:
+            continue
+        if not os.path.isabs(root_path):
+            root_path = os.path.join(PROJECT_ROOT, root_path)
+        resolved_roots.append(os.path.abspath(root_path))
+
+    preferred = []
+    others = []
+
+    for root_path in resolved_roots:
+        if preferred_root in root_path:
+            preferred.append(root_path)
+            continue
+        others.append(root_path)
+
+    return [*preferred, *others]
+
+
+def _resolve_provider_skill_home(provider, skill_cfg):
+    provider_home_map = skill_cfg.get("provider_home_map", {})
+    if not isinstance(provider_home_map, dict):
+        return "", "ai.skill_enforcement.provider_home_map 設定格式錯誤"
+
+    raw_path = str(provider_home_map.get(provider, "")).strip()
+    if not raw_path:
+        return "", f"ai.skill_enforcement.provider_home_map 未定義 provider: {provider}"
+
+    resolved_path = os.path.abspath(os.path.expanduser(raw_path))
+    current_home = os.path.abspath(os.path.expanduser("~"))
+
+    # 2026-02-13 調整方式: 當非 root 執行且設定為 /root 路徑時，自動映射為目前使用者 home。
+    if resolved_path.startswith("/root/") and current_home != "/root":
+        relative_path = os.path.relpath(resolved_path, "/root")
+        resolved_path = os.path.join(current_home, relative_path)
+
+    return resolved_path, ""
+
+
+def _iter_skill_source_roots(skill_cfg, provider):
+    repo_roots = _iter_repo_skill_roots(skill_cfg, provider)
+    source_roots = []
+
+    for root_path in repo_roots:
+        if root_path in source_roots:
+            continue
+        source_roots.append(root_path)
+
+    provider_home_dir, error_message = _resolve_provider_skill_home(provider, skill_cfg)
+    if error_message:
+        return source_roots, error_message, ""
+
+    # 2026-02-13 調整方式: repo skill roots 找不到時，自動 fallback provider home 路徑。
+    if provider_home_dir not in source_roots:
+        source_roots.append(provider_home_dir)
+
+    return source_roots, "", provider_home_dir
+
+
+def _find_skill_path(skill_name, source_roots):
+    for root_path in source_roots:
+        skill_dir = os.path.join(root_path, skill_name)
+        skill_file = os.path.join(skill_dir, "SKILL.md")
+        if os.path.isdir(skill_dir) and os.path.isfile(skill_file):
+            return skill_dir
+
+    return ""
+
+
+def _collect_repo_skill_map(skill_cfg, provider):
+    skill_map = {}
+    source_roots, error_message, _ = _iter_skill_source_roots(skill_cfg, provider)
+    if error_message:
+        return {}, error_message
+
+    for root_path in source_roots:
+        if not os.path.isdir(root_path):
+            continue
+
+        for entry in os.listdir(root_path):
+            if entry in skill_map:
+                continue
+
+            skill_dir = os.path.join(root_path, entry)
+            skill_file = os.path.join(skill_dir, "SKILL.md")
+            if not os.path.isdir(skill_dir):
+                continue
+            if not os.path.isfile(skill_file):
+                continue
+            skill_map[entry] = skill_dir
+
+    return skill_map, ""
+
+
+def _validate_required_skill(task_name, provider, skill_cfg):
+    task_skill_map = skill_cfg.get("task_skill_map", {})
+    if not isinstance(task_skill_map, dict):
+        return False, {}, "ai.skill_enforcement.task_skill_map 設定格式錯誤"
+
+    skill_name = str(task_skill_map.get(task_name, "")).strip()
+    if not skill_name:
+        return False, {}, f"task_skill_map 未定義: {task_name}"
+
+    source_roots, error_message, provider_home_dir = _iter_skill_source_roots(
+        skill_cfg, provider
+    )
+    if error_message:
+        return False, {}, error_message
+
+    repo_skill_dir = _find_skill_path(skill_name, source_roots)
+    if not repo_skill_dir:
+        return False, {}, f"缺少必要 skill: {skill_name}"
+
+    return (
+        True,
+        {
+            "skill_name": skill_name,
+            "repo_skill_dir": repo_skill_dir,
+            "provider_home_dir": provider_home_dir,
+        },
+        "",
+    )
+
+
+def _sync_repo_skills_to_provider_home(provider, skill_cfg):
+    provider_home_dir, error_message = _resolve_provider_skill_home(provider, skill_cfg)
+    if error_message:
+        return {}, error_message
+
+    repo_skill_map, collect_error = _collect_repo_skill_map(skill_cfg, provider)
+    if collect_error:
+        return {}, collect_error
+    if not repo_skill_map:
+        return {}, "repo_skill_roots 下找不到可用 skill"
+
+    try:
+        os.makedirs(provider_home_dir, exist_ok=True)
+    except Exception as e:
+        return {}, f"無法建立 provider skill 目錄: {provider_home_dir}, error: {e}"
+
+    synced_skill_map = {}
+
+    for skill_name, source_dir in repo_skill_map.items():
+        target_dir = os.path.join(provider_home_dir, skill_name)
+        try:
+            normalized_source = os.path.abspath(source_dir)
+            normalized_target = os.path.abspath(target_dir)
+            # 2026-02-13 調整方式: source 與 target 同路徑時跳過覆蓋，避免自刪除。
+            if normalized_source != normalized_target:
+                if os.path.isdir(target_dir):
+                    shutil.rmtree(target_dir)
+                shutil.copytree(source_dir, target_dir)
+        except Exception as e:
+            return {}, f"無法同步 skill 至 provider home: {target_dir}, error: {e}"
+
+        synced_skill_map[skill_name] = target_dir
+
+    return synced_skill_map, ""
+
+
+def _build_skill_enforced_prompt(
+    task_name, base_prompt, skill_name, repo_skill_dir, provider_skill_dir
+):
+    return (
+        "【Skill 強制規則】\n"
+        f"- 任務類型：{task_name}\n"
+        f"- 本次任務必須使用 skill：{skill_name}\n"
+        f"- 專案 skill 路徑：{repo_skill_dir}\n"
+        f"- Provider home skill 路徑：{provider_skill_dir}\n"
+        "- 請先讀取該 skill 的 SKILL.md 並嚴格遵循其 workflow。\n"
+        "- 若無法載入 skill，必須立即回報錯誤並停止，不可改用一般流程。\n\n"
+        "【原始任務】\n"
+        f"{base_prompt}"
+    )
+
+
+def _prepare_task_prompt(task_name, base_prompt, ai_cfg):
+    skill_cfg = _resolve_skill_config(ai_cfg)
+    if not bool(skill_cfg.get("enabled", True)):
+        return True, base_prompt, ""
+
+    provider = str(ai_cfg.get("provider", "claude")).strip()
+    is_strict_mode = _is_strict_skill_mode(skill_cfg)
+
+    is_valid, context, error_message = _validate_required_skill(
+        task_name, provider, skill_cfg
+    )
+    if not is_valid:
+        if is_strict_mode:
+            logger.error(f"[{task_name}] skill preflight 失敗: {error_message}")
+            return False, "", error_message
+        logger.warning(
+            f"[{task_name}] skill preflight 警告，改用一般流程: {error_message}"
+        )
+        return True, base_prompt, ""
+
+    synced_skill_map, sync_error = _sync_repo_skills_to_provider_home(
+        provider, skill_cfg
+    )
+    if sync_error:
+        if is_strict_mode:
+            logger.error(f"[{task_name}] skill 同步失敗: {sync_error}")
+            return False, "", sync_error
+        logger.warning(f"[{task_name}] skill 同步警告，改用一般流程: {sync_error}")
+        return True, base_prompt, ""
+
+    skill_name = context["skill_name"]
+    provider_skill_dir = synced_skill_map.get(skill_name, "")
+    if not provider_skill_dir:
+        error_message = f"無法取得 provider skill 路徑: {skill_name}"
+        if is_strict_mode:
+            logger.error(f"[{task_name}] {error_message}")
+            return False, "", error_message
+        logger.warning(f"[{task_name}] {error_message}，改用一般流程")
+        return True, base_prompt, ""
+
+    logger.info(
+        f"[{task_name}] skill preflight 成功: skill={skill_name}, provider={provider}, "
+        f"repo={context['repo_skill_dir']}, provider_home={provider_skill_dir}"
+    )
+
+    prompt = _build_skill_enforced_prompt(
+        task_name,
+        base_prompt,
+        skill_name,
+        context["repo_skill_dir"],
+        provider_skill_dir,
+    )
+    return True, prompt, ""
+
+
 def _build_provider_command(ai_cfg, prompt):
     provider = ai_cfg.get("provider", "claude")
 
@@ -104,13 +374,13 @@ def _build_provider_command(ai_cfg, prompt):
         return cmd, None, False
 
     if provider == "codex":
-        custom_cfg = ai_cfg.get("codex", {})
-        mode = custom_cfg.get("mode", "argv")
-        shell = bool(custom_cfg.get("shell", True))
-        template = str(custom_cfg.get("command_template", "")).strip()
+        codex_cfg = ai_cfg.get("codex", {})
+        mode = codex_cfg.get("mode", "argv")
+        shell = bool(codex_cfg.get("shell", True))
+        template = str(codex_cfg.get("command_template", "")).strip()
 
         if not template:
-            raise ValueError("ai.custom.command_template 不可為空")
+            raise ValueError("ai.codex.command_template 不可為空")
 
         if mode == "stdin":
             cmd = template
@@ -230,13 +500,19 @@ def run_news_stock_picker(config):
     )
 
     ai_cfg = _resolve_ai_config(config)
+    can_run, prompt, error_message = _prepare_task_prompt("news", prompt, ai_cfg)
+    if not can_run:
+        return False, "", error_message
+
     timeout_minutes = _task_timeout(ai_cfg, "news", 10)
     started_at = time.time()
     success, stdout, stderr = run_ai_task("news", prompt, config, timeout_minutes)
     if not success:
         return False, stdout, stderr
 
-    report = _find_recent_output(os.path.join(STRATEGY_DIR, "news_strategy_*.md"), started_at)
+    report = _find_recent_output(
+        os.path.join(STRATEGY_DIR, "news_strategy_*.md"), started_at
+    )
     if not report:
         err = "AI 任務成功但未找到新產生的新聞報告檔案 (strategy/news_strategy_*.md)"
         logger.error(err)
@@ -274,13 +550,19 @@ def run_tw_stock_analyzer(config, preferences):
     )
 
     ai_cfg = _resolve_ai_config(config)
+    can_run, prompt, error_message = _prepare_task_prompt("daily", prompt, ai_cfg)
+    if not can_run:
+        return False, "", error_message
+
     timeout_minutes = _task_timeout(ai_cfg, "daily", 15)
     started_at = time.time()
     success, stdout, stderr = run_ai_task("daily", prompt, config, timeout_minutes)
     if not success:
         return False, stdout, stderr
 
-    plan = _find_recent_output(os.path.join(OUTPUTS_DIR, "trading_plan_*.md"), started_at)
+    plan = _find_recent_output(
+        os.path.join(OUTPUTS_DIR, "trading_plan_*.md"), started_at
+    )
     if not plan:
         err = "AI 任務成功但未找到新產生的交易計畫檔案 (outputs/trading_plan_*.md)"
         logger.error(err)
@@ -293,14 +575,13 @@ def run_single_stock_analysis(stock_code):
     """
     執行單一個股技術分析（沿用既有 Python 腳本）
     """
-    script_path = os.path.join(
-        PROJECT_ROOT,
-        ".claude",
-        "skills",
-        "single-stock-analyzer",
-        "scripts",
-        "analyze_single_stock.py",
-    )
+    # 2026-02-13 調整方式: 腳本改由 scheduler/scripts 內建，不再依賴 .claude bind mount。
+    script_path = SINGLE_STOCK_SCRIPT_PATH
+
+    if not os.path.exists(script_path):
+        err = f"找不到個股分析腳本: {script_path}"
+        logger.error(err)
+        return False, "", err
 
     cmd = ["python3", script_path, stock_code]
     logger.debug(f"執行個股分析: {stock_code}")
@@ -332,7 +613,9 @@ def find_latest_news_report(target_date=None):
     if target_date is None:
         target_date = date.today()
 
-    report_pattern = os.path.join(STRATEGY_DIR, f"news_strategy_{target_date.isoformat()}*")
+    report_pattern = os.path.join(
+        STRATEGY_DIR, f"news_strategy_{target_date.isoformat()}*"
+    )
     reports = glob.glob(report_pattern)
     if reports:
         return reports[0]
@@ -353,7 +636,9 @@ def find_latest_trading_plan(target_date=None):
     if os.path.exists(report_path):
         return report_path
 
-    report_path_alt = os.path.join(OUTPUTS_DIR, f"trading_plan_{target_date.isoformat().replace('-', '')}.md")
+    report_path_alt = os.path.join(
+        OUTPUTS_DIR, f"trading_plan_{target_date.isoformat().replace('-', '')}.md"
+    )
     if os.path.exists(report_path_alt):
         return report_path_alt
 

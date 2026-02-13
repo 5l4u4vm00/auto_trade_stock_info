@@ -13,6 +13,3 @@ htmlcov/
 logs/*
 outputs/*
 strategy/*
-
-.claude
-.codex

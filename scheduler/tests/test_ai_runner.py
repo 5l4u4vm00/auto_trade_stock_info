@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -12,6 +13,14 @@ import ai_runner  # noqa: E402
 
 
 class TestAIRunner(unittest.TestCase):
+    def _create_skill_dir(self, root_path, skill_name):
+        skill_dir = os.path.join(root_path, skill_name)
+        os.makedirs(skill_dir, exist_ok=True)
+        skill_file = os.path.join(skill_dir, "SKILL.md")
+        with open(skill_file, "w", encoding="utf-8") as file_obj:
+            file_obj.write(f"# {skill_name}\n")
+        return skill_dir
+
     def test_run_ai_task_claude_argv(self):
         config = {
             "ai": {
@@ -40,12 +49,12 @@ class TestAIRunner(unittest.TestCase):
         self.assertEqual(call_kwargs["shell"], False)
         self.assertIsNone(call_kwargs["input"])
 
-    def test_run_ai_task_custom_stdin(self):
+    def test_run_ai_task_codex_stdin(self):
         config = {
             "ai": {
-                "provider": "custom",
+                "provider": "codex",
                 "retry": {"max_attempts": 1, "backoff_seconds": 0},
-                "custom": {
+                "codex": {
                     "command_template": "myai --run",
                     "mode": "stdin",
                     "shell": False,
@@ -66,12 +75,12 @@ class TestAIRunner(unittest.TestCase):
         self.assertEqual(call_kwargs["input"], "test prompt")
         self.assertEqual(call_kwargs["shell"], False)
 
-    def test_run_ai_task_custom_argv_shell_false_prompt_token(self):
+    def test_run_ai_task_codex_argv_shell_false_prompt_token(self):
         config = {
             "ai": {
-                "provider": "custom",
+                "provider": "codex",
                 "retry": {"max_attempts": 1, "backoff_seconds": 0},
-                "custom": {
+                "codex": {
                     "command_template": "myai --prompt {prompt}",
                     "mode": "argv",
                     "shell": False,
@@ -128,7 +137,12 @@ class TestAIRunner(unittest.TestCase):
         self.assertIn("Timeout", stderr)
 
     def test_news_task_requires_output_file(self):
-        config = {"ai": {"provider": "claude"}}
+        config = {
+            "ai": {
+                "provider": "claude",
+                "skill_enforcement": {"enabled": False},
+            }
+        }
         with patch("ai_runner.run_ai_task", return_value=(True, "ok", "")):
             with patch("ai_runner._find_recent_output", return_value=None):
                 success, _, stderr = ai_runner.run_news_stock_picker(config)
@@ -137,7 +151,12 @@ class TestAIRunner(unittest.TestCase):
         self.assertIn("未找到新產生的新聞報告檔案", stderr)
 
     def test_daily_task_requires_output_file(self):
-        config = {"ai": {"provider": "claude"}}
+        config = {
+            "ai": {
+                "provider": "claude",
+                "skill_enforcement": {"enabled": False},
+            }
+        }
         prefs = {"risk_level": "moderate"}
         with patch("ai_runner.run_ai_task", return_value=(True, "ok", "")):
             with patch("ai_runner._find_recent_output", return_value=None):
@@ -145,6 +164,149 @@ class TestAIRunner(unittest.TestCase):
 
         self.assertFalse(success)
         self.assertIn("未找到新產生的交易計畫檔案", stderr)
+
+    def test_single_stock_script_missing(self):
+        with patch.object(ai_runner, "SINGLE_STOCK_SCRIPT_PATH", "/tmp/not-found.py"):
+            success, _, stderr = ai_runner.run_single_stock_analysis("2330")
+
+        self.assertFalse(success)
+        self.assertIn("找不到個股分析腳本", stderr)
+
+    def test_news_task_strict_missing_skill_should_fail(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = {
+                "ai": {
+                    "provider": "claude",
+                    "skill_enforcement": {
+                        "enabled": True,
+                        "mode": "strict",
+                        "repo_skill_roots": [os.path.join(temp_dir, "repo_skills")],
+                        "task_skill_map": {"news": "news-stock-picker"},
+                        "provider_home_map": {
+                            "claude": os.path.join(temp_dir, "home_skills")
+                        },
+                    },
+                }
+            }
+
+            with patch("ai_runner.run_ai_task") as mock_run:
+                success, _, stderr = ai_runner.run_news_stock_picker(config)
+
+        self.assertFalse(success)
+        self.assertIn("缺少必要 skill", stderr)
+        mock_run.assert_not_called()
+
+    def test_news_task_injects_skill_prompt_when_enforced(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_skills_dir = os.path.join(temp_dir, "repo_skills")
+            self._create_skill_dir(repo_skills_dir, "news-stock-picker")
+
+            config = {
+                "ai": {
+                    "provider": "claude",
+                    "skill_enforcement": {
+                        "enabled": True,
+                        "mode": "strict",
+                        "repo_skill_roots": [repo_skills_dir],
+                        "task_skill_map": {"news": "news-stock-picker"},
+                        "provider_home_map": {
+                            "claude": os.path.join(temp_dir, "home_skills")
+                        },
+                    },
+                }
+            }
+
+            with patch("ai_runner.run_ai_task", return_value=(True, "ok", "")) as mock_run:
+                with patch("ai_runner._find_recent_output", return_value="/tmp/report.md"):
+                    success, _, _ = ai_runner.run_news_stock_picker(config)
+
+        self.assertTrue(success)
+        run_call_args = mock_run.call_args.args
+        injected_prompt = run_call_args[1]
+        self.assertIn("【Skill 強制規則】", injected_prompt)
+        self.assertIn("本次任務必須使用 skill：news-stock-picker", injected_prompt)
+
+    def test_news_task_warn_mode_fallback_to_plain_prompt(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = {
+                "ai": {
+                    "provider": "claude",
+                    "skill_enforcement": {
+                        "enabled": True,
+                        "mode": "warn",
+                        "repo_skill_roots": [os.path.join(temp_dir, "repo_skills")],
+                        "task_skill_map": {"news": "news-stock-picker"},
+                        "provider_home_map": {
+                            "claude": os.path.join(temp_dir, "home_skills")
+                        },
+                    },
+                }
+            }
+
+            with patch("ai_runner.run_ai_task", return_value=(True, "ok", "")) as mock_run:
+                with patch("ai_runner._find_recent_output", return_value="/tmp/report.md"):
+                    success, _, _ = ai_runner.run_news_stock_picker(config)
+
+        self.assertTrue(success)
+        run_call_args = mock_run.call_args.args
+        prompt = run_call_args[1]
+        self.assertNotIn("【Skill 強制規則】", prompt)
+
+    # 2026-02-13 調整方式: 驗證 repo roots 缺 skill 時，會 fallback 使用 provider home。
+    def test_news_task_strict_uses_provider_home_skill_as_fallback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home_skills_dir = os.path.join(temp_dir, "home_skills")
+            skill_dir = self._create_skill_dir(home_skills_dir, "news-stock-picker")
+
+            config = {
+                "ai": {
+                    "provider": "claude",
+                    "skill_enforcement": {
+                        "enabled": True,
+                        "mode": "strict",
+                        "repo_skill_roots": [os.path.join(temp_dir, "repo_skills")],
+                        "task_skill_map": {"news": "news-stock-picker"},
+                        "provider_home_map": {
+                            "claude": home_skills_dir
+                        },
+                    },
+                }
+            }
+
+            with patch("ai_runner.run_ai_task", return_value=(True, "ok", "")) as mock_run:
+                with patch("ai_runner._find_recent_output", return_value="/tmp/report.md"):
+                    success, _, _ = ai_runner.run_news_stock_picker(config)
+
+        self.assertTrue(success)
+        run_call_args = mock_run.call_args.args
+        injected_prompt = run_call_args[1]
+        self.assertIn("【Skill 強制規則】", injected_prompt)
+        self.assertIn(f"專案 skill 路徑：{skill_dir}", injected_prompt)
+
+    # 2026-02-13 調整方式: 驗證來源與目標同路徑時，不會執行自刪除或重複 copy。
+    def test_sync_repo_skills_source_equals_target_should_skip_copy(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home_skills_dir = os.path.join(temp_dir, "home_skills")
+            skill_dir = self._create_skill_dir(home_skills_dir, "news-stock-picker")
+            skill_cfg = {
+                "enabled": True,
+                "mode": "strict",
+                "repo_skill_roots": [home_skills_dir],
+                "task_skill_map": {"news": "news-stock-picker"},
+                "provider_home_map": {
+                    "claude": home_skills_dir
+                },
+            }
+
+            synced_skill_map, sync_error = ai_runner._sync_repo_skills_to_provider_home(
+                "claude", skill_cfg
+            )
+
+        self.assertEqual(sync_error, "")
+        self.assertEqual(
+            synced_skill_map.get("news-stock-picker"),
+            skill_dir,
+        )
 
 
 if __name__ == "__main__":

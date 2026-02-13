@@ -19,3 +19,6 @@ outputs/*.md
 .DS_Store
 
 .env
+
+.credentials*
+auth*

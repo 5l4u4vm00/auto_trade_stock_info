@@ -8,15 +8,20 @@ services:
     restart: unless-stopped
     working_dir: /app
     environment:
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      CLAUDE_HOME_TGZ_B64: ${CLAUDE_AUTH_TGZ_B64:-}
+      CODEX_HOME_TGZ_B64: ${CODEX_AUTH_TGZ_B64:-}
       TZ: ${TZ:-Asia/Taipei}
-      PYTHONUNBUFFERED: "1"
+    # 2026-02-13 調整方式: 保留互動式終端，方便 docker exec -it 進入容器操作。
+    stdin_open: true
+    tty: true
     command: ["python", "-u", "scheduler/main.py"]
     volumes:
-      - ./scheduler/config.yaml:/app/scheduler/config.yaml:ro
-      - ./logs:/app/logs
-      - ./outputs:/app/outputs
-      - ./strategy:/app/strategy
-      - ./.claude:/app/.claude:ro
-      - ${HOME}/.claude:/root/.claude
-      - ${HOME}/.codex:/root/.codex
+      # 2026-02-13 調整方式: 以 named volumes 取代 host bind，改為容器內部管理資料。
+      - scheduler_logs:/app/logs
+      - scheduler_outputs:/app/outputs
+      - scheduler_strategy:/app/strategy
+
+volumes:
+  scheduler_logs:
+  scheduler_outputs:
+  scheduler_strategy:
