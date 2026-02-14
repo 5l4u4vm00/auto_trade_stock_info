@@ -22,7 +22,6 @@ import logging
 import os
 import signal
 import sys
-import time
 from datetime import date, datetime
 from pathlib import Path
 
@@ -37,12 +36,12 @@ from apscheduler.triggers.cron import CronTrigger
 from ai_runner import (
     run_news_stock_picker,
     run_tw_stock_analyzer,
-    run_single_stock_analysis,
+    run_multi_stock_analysis,
     find_latest_news_report,
     find_latest_trading_plan,
 )
 from email_sender import EmailSender
-from report_parser import parse_trading_plan, parse_single_stock_result, check_alert
+from report_parser import parse_trading_plan, check_alert
 from trading_calendar import is_trading_day
 
 # ============================================================
@@ -261,30 +260,22 @@ def job_intraday_monitor(config):
 
     logger.info(f"監控清單: {stock_list}")
 
-    # 逐一分析
+    # 2026-02-14 調整方式: monitor 改為 multi-stock 批次分析。
     threshold = config.get('signal_threshold', {})
     alerts = []
 
-    for stock_code in stock_list:
-        logger.info(f"分析個股: {stock_code}")
-        success, stdout, stderr = run_single_stock_analysis(stock_code)
+    logger.info(f"批次分析個股: {stock_list}")
+    success, parsed_results, stderr = run_multi_stock_analysis(stock_list, config)
+    if not success:
+        logger.warning(f"批次個股分析失敗: {stderr[:200]}")
+        return
 
-        if not success:
-            logger.warning(f"個股分析失敗 ({stock_code}): {stderr[:100]}")
-            continue
-
-        result = parse_single_stock_result(stdout)
-        if not result:
-            continue
-
+    for result in parsed_results:
         alert = check_alert(result, threshold)
         if alert:
             alerts.append(alert)
             logger.info(f"觸發警報: {alert['stock_code']} {alert['stock_name']} "
                         f"({alert['signal_type']}) - {alert['reason']}")
-
-        # 避免 API rate limiting
-        time.sleep(1)
 
     # 彙整警報並寄送
     if alerts:

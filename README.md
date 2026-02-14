@@ -21,11 +21,11 @@
 │   ├── trading_calendar.py   # 台股交易日判斷
 │   ├── config.yaml           # 系統設定
 │   ├── requirements.txt      # Python 套件
-│   ├── scripts/              # 內建個股分析腳本
 │   └── tests/                # 單元測試
 ├── docker/                   # container 啟動初始化
 ├── strategy/                 # 新聞選股報告輸出
 ├── outputs/                  # 每日交易計畫輸出（執行後產生）
+├── intraday/                 # 盤中個股分析報告輸出（執行後產生）
 └── logs/                     # 排程日誌
 ```
 
@@ -42,6 +42,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r scheduler/requirements.txt
 mkdir -p logs outputs strategy
+mkdir -p intraday
 ```
 
 ## 設定
@@ -57,7 +58,7 @@ mkdir -p logs outputs strategy
 
 ## Skill 強制模式
 
-2026-02-13 調整方式：`news` / `daily` 任務啟用 skill preflight，缺少必要 skill 時會直接失敗（`strict`）。
+2026-02-14 調整方式：`news` / `daily` / `monitor` 任務啟用 skill preflight，缺少必要 skill 時會直接失敗（`strict`）。
 
 設定位置：`scheduler/config.yaml` -> `ai.skill_enforcement`
 
@@ -72,6 +73,7 @@ ai:
     task_skill_map:
       news: "news-stock-picker"
       daily: "tw-stock-analyzer"
+      monitor: "single-stock-analyzer"
     provider_home_map:
       claude: "/root/.claude/skills"
       codex: "/root/.codex/skills"
@@ -90,7 +92,7 @@ ai:
 `docker-compose.yaml` 已改為容器內建設定與 named volumes，不再掛載：
 
 - `./scheduler/config.yaml`
-- `./logs`、`./outputs`、`./strategy`
+- `./logs`、`./outputs`、`./strategy`、`./intraday`
 - `./.claude`、`${HOME}/.claude`、`${HOME}/.codex`
 
 `scheduler/config.yaml` 會隨 image 打包，修改設定後需重新 build。
@@ -171,7 +173,7 @@ python3 scheduler/main.py --test-job monitor
 
 - Job 1（新聞選股）：週日 `00:00`
 - Job 2（每日分析）：週一到週五 `08:00`
-- Job 3（盤中監控）：週一到週五 `09:00-13:30`，每 `30` 分鐘
+- Job 3（盤中監控）：週一到週五 `09:00-13:30`，每 `10` 分鐘
 
 ## 輸出與日誌
 
@@ -179,6 +181,17 @@ python3 scheduler/main.py --test-job monitor
 - PID 檔：`scheduler/scheduler.pid`
 - 新聞策略：`strategy/news_strategy_*.md`
 - 交易計畫：`outputs/trading_plan_*.md`
+- 盤中個股報告：`intraday/stock_analysis_{股票代號}_{YYYYMMDD}.md`
+
+盤中個股報告 YAML frontmatter 契約欄位：
+
+- `stock_code`
+- `stock_name`
+- `suggestion`（buy/sell/watch/hold）
+- `score`
+- `bullish_signals`（array）
+- `bearish_signals`（array）
+- `price_close`
 
 ## 測試
 
@@ -190,7 +203,7 @@ python3 -m unittest discover -s scheduler/tests -p "test_*.py"
 
 - `scheduler/trading_calendar.py` 的假日清單目前為手動維護（含 2025、2026），每年需更新。
 - `daily` / `news` 任務除了 CLI 回傳成功，還要求新報告檔案實際產生才視為成功。
-- 盤中監控會呼叫 `scheduler/scripts/analyze_single_stock.py`，該腳本已隨專案打包。
+- `monitor` 任務會強制使用 `single-stock-analyzer` skill，並要求輸出 Markdown + YAML frontmatter。
 
 # Scheduler AI Provider 設定
 
@@ -209,6 +222,7 @@ ai:
   timeout_minutes:
     news: 10
     daily: 15
+    monitor: 5
   retry:
     max_attempts: 2
     backoff_seconds: 3
@@ -270,6 +284,7 @@ ai:
 
 - `news` 任務：CLI return code = 0 且有新產生 `strategy/news_strategy_*.md`
 - `daily` 任務：CLI return code = 0 且有新產生 `outputs/trading_plan_*.md`
+- `monitor` 任務：CLI return code = 0 且有新產生 `intraday/stock_analysis_*.md`
 - 若只成功執行 CLI、但未產生檔案，任務仍視為失敗
 
 # CMD ["python", "-u", "scheduler/main.py"]

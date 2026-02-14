@@ -8,6 +8,8 @@ import logging
 import re
 from pathlib import Path
 
+import yaml
+
 logger = logging.getLogger(__name__)
 
 
@@ -119,12 +121,138 @@ def _is_likely_stock_code(code, line):
     return False
 
 
-def parse_single_stock_result(json_str):
+def _to_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_float(value, default=0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_signals(value):
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return []
+
+
+def _build_single_stock_result(data):
+    bullish_signals = _normalize_signals(data.get('bullish_signals', []))
+    bearish_signals = _normalize_signals(data.get('bearish_signals', []))
+    suggestion = str(data.get('suggestion', '')).strip().lower()
+
+    return {
+        'stock_code': str(data.get('stock_code', '')).strip(),
+        'stock_name': str(data.get('stock_name', '')).strip(),
+        'price': _to_float(data.get('price', 0)),
+        'suggestion': suggestion,
+        'score': _to_int(data.get('score', 0)),
+        'bullish_count': len(bullish_signals),
+        'bearish_count': len(bearish_signals),
+        'bullish_signals': bullish_signals,
+        'bearish_signals': bearish_signals,
+        'error': False,
+    }
+
+
+def _parse_single_stock_json(raw_text):
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError:
+        return None
+
+    if data.get('error'):
+        logger.warning(f"個股分析回報錯誤: {data.get('message', 'unknown')}")
+        return None
+
+    return _build_single_stock_result(
+        {
+            'stock_code': data.get('stock_code', ''),
+            'stock_name': data.get('stock_name', ''),
+            'price': data.get('price', {}).get('close', 0),
+            'suggestion': data.get('suggestion', ''),
+            'score': data.get('score', 0),
+            'bullish_signals': data.get('bullish_signals', []),
+            'bearish_signals': data.get('bearish_signals', []),
+        }
+    )
+
+
+def _parse_markdown_frontmatter(raw_text):
+    stripped_text = raw_text.strip()
+    if not stripped_text.startswith('---'):
+        return None
+
+    lines = stripped_text.splitlines()
+    if not lines or lines[0].strip() != '---':
+        return None
+
+    end_index = -1
+    for idx in range(1, len(lines)):
+        if lines[idx].strip() == '---':
+            end_index = idx
+            break
+
+    if end_index < 0:
+        return None
+
+    frontmatter_text = '\n'.join(lines[1:end_index])
+    try:
+        frontmatter = yaml.safe_load(frontmatter_text)
+    except yaml.YAMLError as exc:
+        logger.warning(f"frontmatter YAML 解析失敗: {exc}")
+        return None
+
+    if not isinstance(frontmatter, dict):
+        return None
+    return frontmatter
+
+
+def _parse_single_stock_markdown(raw_text):
+    frontmatter = _parse_markdown_frontmatter(raw_text)
+    if not frontmatter:
+        return None
+
+    required_fields = [
+        'stock_code',
+        'stock_name',
+        'suggestion',
+        'score',
+        'bullish_signals',
+        'bearish_signals',
+        'price_close',
+    ]
+    missing_fields = [field for field in required_fields if field not in frontmatter]
+    if missing_fields:
+        logger.warning(f"frontmatter 缺少必要欄位: {missing_fields}")
+        return None
+
+    return _build_single_stock_result(
+        {
+            'stock_code': frontmatter.get('stock_code', ''),
+            'stock_name': frontmatter.get('stock_name', ''),
+            'price': frontmatter.get('price_close', 0),
+            'suggestion': frontmatter.get('suggestion', ''),
+            'score': frontmatter.get('score', 0),
+            'bullish_signals': frontmatter.get('bullish_signals', []),
+            'bearish_signals': frontmatter.get('bearish_signals', []),
+        }
+    )
+
+
+def parse_single_stock_result(raw_text):
     """
-    解析 analyze_single_stock.py 的 JSON 輸出，判斷買賣信號
+    解析個股分析輸出（Markdown frontmatter / JSON），判斷買賣信號
 
     Args:
-        json_str: analyze_single_stock.py 的 stdout（JSON 字串）
+        raw_text: 來自 AI 或腳本的輸出內容
 
     Returns:
         dict: {
@@ -141,28 +269,20 @@ def parse_single_stock_result(json_str):
         }
         或 None 如果解析失敗
     """
-    try:
-        data = json.loads(json_str)
-    except json.JSONDecodeError:
-        logger.error(f"JSON 解析失敗: {json_str[:200]}")
+    if not raw_text:
         return None
 
-    if data.get('error'):
-        logger.warning(f"個股分析回報錯誤: {data.get('message', 'unknown')}")
-        return None
+    # 2026-02-14 調整方式: monitor 輸出改為 Markdown + frontmatter，並保留 JSON 相容性。
+    parsed_result = _parse_single_stock_markdown(raw_text)
+    if parsed_result:
+        return parsed_result
 
-    return {
-        'stock_code': data.get('stock_code', ''),
-        'stock_name': data.get('stock_name', ''),
-        'price': data.get('price', {}).get('close', 0),
-        'suggestion': data.get('suggestion', ''),
-        'score': data.get('score', 0),
-        'bullish_count': len(data.get('bullish_signals', [])),
-        'bearish_count': len(data.get('bearish_signals', [])),
-        'bullish_signals': data.get('bullish_signals', []),
-        'bearish_signals': data.get('bearish_signals', []),
-        'error': False,
-    }
+    parsed_result = _parse_single_stock_json(raw_text)
+    if parsed_result:
+        return parsed_result
+
+    logger.error(f"個股分析結果解析失敗: {str(raw_text)[:200]}")
+    return None
 
 
 def check_alert(parsed_result, threshold_config):

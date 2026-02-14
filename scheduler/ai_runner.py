@@ -4,8 +4,10 @@ AI CLI 呼叫模組（provider-agnostic）
 """
 
 import glob
+import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -17,9 +19,7 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 STRATEGY_DIR = os.path.join(PROJECT_ROOT, "strategy")
 OUTPUTS_DIR = os.path.join(PROJECT_ROOT, "outputs")
-SINGLE_STOCK_SCRIPT_PATH = os.path.join(
-    PROJECT_ROOT, "scheduler", "scripts", "analyze_single_stock.py"
-)
+INTRADAY_DIR = os.path.join(PROJECT_ROOT, "intraday")
 
 DEFAULT_ALLOWED_TOOLS = "Bash,Read,Write,Glob,Grep,WebSearch,WebFetch"
 
@@ -28,6 +28,7 @@ DEFAULT_AI_CONFIG = {
     "timeout_minutes": {
         "news": 10,
         "daily": 15,
+        "monitor": 5,
     },
     "retry": {
         "max_attempts": 2,
@@ -54,6 +55,8 @@ DEFAULT_AI_CONFIG = {
         "task_skill_map": {
             "news": "news-stock-picker",
             "daily": "tw-stock-analyzer",
+            "monitor": "multi-stock-analyzer",
+            "monitor_single": "single-stock-analyzer",
         },
         "provider_home_map": {
             "claude": "/root/.claude/skills",
@@ -571,41 +574,266 @@ def run_tw_stock_analyzer(config, preferences):
     return True, stdout, stderr
 
 
-def run_single_stock_analysis(stock_code):
-    """
-    執行單一個股技術分析（沿用既有 Python 腳本）
-    """
-    # 2026-02-13 調整方式: 腳本改由 scheduler/scripts 內建，不再依賴 .claude bind mount。
-    script_path = SINGLE_STOCK_SCRIPT_PATH
+def _safe_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
-    if not os.path.exists(script_path):
-        err = f"找不到個股分析腳本: {script_path}"
-        logger.error(err)
-        return False, "", err
 
-    cmd = ["python3", script_path, stock_code]
-    logger.debug(f"執行個股分析: {stock_code}")
+def _safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_signal_list(value):
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return []
+
+
+def _build_intraday_multi_monitor_prompt(stock_codes):
+    stock_code_list = " ".join(stock_codes)
+    return (
+        f"請針對以下股票一次執行盤中技術分析：{stock_code_list}\n"
+        "請強制使用 multi-stock-analyzer skill，並依其 workflow 執行批次腳本。\n"
+        "輸出要求：\n"
+        "1. 回覆內容僅限 JSON。\n"
+        "2. 不可輸出 Markdown、程式碼區塊或其他說明文字。\n"
+        "3. JSON 需包含 results 與 failed_symbols 欄位。\n"
+        "請直接執行，不需要再提問。"
+    )
+
+
+def _parse_multi_stock_stdout(raw_text):
+    if not raw_text:
+        return None
+
+    candidates = [raw_text.strip()]
+    json_block_match = re.search(
+        r"```json\s*(\{.*?\})\s*```",
+        raw_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if json_block_match:
+        candidates.append(json_block_match.group(1).strip())
+
+    first_brace_index = raw_text.find("{")
+    last_brace_index = raw_text.rfind("}")
+    if first_brace_index >= 0 and last_brace_index > first_brace_index:
+        candidates.append(raw_text[first_brace_index:last_brace_index + 1].strip())
+
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
+
+    return None
+
+
+def _normalize_multi_stock_result(result_item):
+    if not isinstance(result_item, dict):
+        return None
+
+    stock_code = str(result_item.get("stock_code", "")).strip()
+    if not stock_code:
+        return None
+
+    price_data = result_item.get("price", {})
+    if not isinstance(price_data, dict):
+        price_data = {}
+
+    bullish_signals = _normalize_signal_list(result_item.get("bullish_signals", []))
+    bearish_signals = _normalize_signal_list(result_item.get("bearish_signals", []))
+
+    return {
+        "stock_code": stock_code,
+        "stock_name": str(result_item.get("stock_name", "")).strip(),
+        "price": _safe_float(price_data.get("close", 0)),
+        "suggestion": str(result_item.get("suggestion", "")).strip().lower(),
+        "score": _safe_int(result_item.get("score", 0)),
+        "bullish_count": len(bullish_signals),
+        "bearish_count": len(bearish_signals),
+        "bullish_signals": bullish_signals,
+        "bearish_signals": bearish_signals,
+        "error": False,
+    }
+
+
+def run_multi_stock_analysis(stock_codes, config=None):
+    """
+    執行多檔個股技術分析（透過 multi-stock-analyzer skill）
+
+    Args:
+        stock_codes: 股票代號清單
+        config: scheduler 設定 dict（可選）
+    """
+    normalized_stock_codes = []
+    seen_codes = set()
+    for stock_code in stock_codes or []:
+        stock_code_text = str(stock_code).strip()
+        if not stock_code_text or stock_code_text in seen_codes:
+            continue
+        seen_codes.add(stock_code_text)
+        normalized_stock_codes.append(stock_code_text)
+
+    if not normalized_stock_codes:
+        return False, [], "stock_codes 不可為空"
+
+    runtime_config = config or {}
+    ai_cfg = _resolve_ai_config(runtime_config)
+    timeout_minutes = _task_timeout(ai_cfg, "monitor", 5)
+    prompt = _build_intraday_multi_monitor_prompt(normalized_stock_codes)
+
+    can_run, prompt, error_message = _prepare_task_prompt("monitor", prompt, ai_cfg)
+    if not can_run:
+        return False, [], error_message
+
+    # 2026-02-14 調整方式: monitor 改為 multi-stock skill 一次分析多檔並回傳 JSON。
+    success, stdout, stderr = run_ai_task(
+        "monitor",
+        prompt,
+        runtime_config,
+        timeout_minutes,
+    )
+    if not success:
+        return False, [], stderr
+
+    raw_result = _parse_multi_stock_stdout(stdout)
+    if not raw_result:
+        error_message = f"批次分析輸出無法解析 JSON: {stdout[:200]}"
+        logger.error(error_message)
+        return False, [], error_message
+
+    raw_items = raw_result.get("results", [])
+    if not isinstance(raw_items, list):
+        raw_items = []
+
+    parsed_results = []
+    for raw_item in raw_items:
+        parsed_item = _normalize_multi_stock_result(raw_item)
+        if parsed_item:
+            parsed_results.append(parsed_item)
+
+    failed_items = raw_result.get("failed_symbols", [])
+    if isinstance(failed_items, list) and failed_items:
+        logger.warning(f"批次分析失敗標的數量: {len(failed_items)}")
+
+    if parsed_results:
+        return True, parsed_results, stderr
+
+    failure_message = str(raw_result.get("message", "")).strip()
+    if not failure_message:
+        failure_message = "AI 任務完成但沒有可用個股分析結果"
+    logger.error(failure_message)
+    return False, [], failure_message
+
+
+def _build_intraday_monitor_prompt(stock_code, report_path):
+    return (
+        f"請針對個股 {stock_code} 執行盤中技術分析。\n"
+        f"請強制使用 single-stock-analyzer skill 完成分析。\n"
+        f"輸出檔案必須儲存為：{report_path}\n\n"
+        "報告內容請遵循下列格式要求：\n"
+        "1. 檔案格式為 Markdown。\n"
+        "2. 最上方必須放 YAML frontmatter（使用 --- 包覆）。\n"
+        "3. frontmatter 必須包含：\n"
+        "   - stock_code\n"
+        "   - stock_name\n"
+        "   - suggestion（buy/sell/watch/hold）\n"
+        "   - score（整數）\n"
+        "   - bullish_signals（字串陣列）\n"
+        "   - bearish_signals（字串陣列）\n"
+        "   - price_close（數字）\n\n"
+        "請直接執行並寫入指定檔案，不需要再提問。"
+    )
+
+
+def _find_recent_intraday_report(stock_code, report_date, started_at):
+    today_pattern = os.path.join(
+        INTRADAY_DIR, f"stock_analysis_{stock_code}_{report_date}*.md"
+    )
+    report_path = _find_recent_output(today_pattern, started_at)
+    if report_path:
+        return report_path
+
+    fallback_pattern = os.path.join(INTRADAY_DIR, f"stock_analysis_{stock_code}_*.md")
+    return _find_recent_output(fallback_pattern, started_at)
+
+
+def run_single_stock_analysis(stock_code, config=None):
+    """
+    執行單一個股技術分析（透過 single-stock-analyzer skill）
+
+    Args:
+        stock_code: 股票代號
+        config: scheduler 設定 dict（可選）
+    """
+    normalized_stock_code = str(stock_code).strip()
+    if not normalized_stock_code:
+        return False, "", "stock_code 不可為空"
+
+    runtime_config = config or {}
+    ai_cfg = _resolve_ai_config(runtime_config)
+    timeout_minutes = _task_timeout(ai_cfg, "monitor", 5)
+
+    os.makedirs(INTRADAY_DIR, exist_ok=True)
+
+    report_date = date.today().strftime("%Y%m%d")
+    target_report_path = os.path.join(
+        INTRADAY_DIR,
+        f"stock_analysis_{normalized_stock_code}_{report_date}.md",
+    )
+    prompt = _build_intraday_monitor_prompt(normalized_stock_code, target_report_path)
+
+    can_run, prompt, error_message = _prepare_task_prompt(
+        "monitor_single",
+        prompt,
+        ai_cfg,
+    )
+    if not can_run:
+        return False, "", error_message
+
+    # 2026-02-14 調整方式: monitor 改為 skill 流程並固定輸出到專案根目錄 intraday/。
+    started_at = time.time()
+    success, stdout, stderr = run_ai_task(
+        "monitor",
+        prompt,
+        runtime_config,
+        timeout_minutes,
+    )
+    if not success:
+        return False, stdout, stderr
+
+    report_path = _find_recent_intraday_report(
+        normalized_stock_code,
+        report_date,
+        started_at,
+    )
+    if not report_path:
+        error_message = (
+            "AI 任務成功但未找到新產生的個股分析檔案 "
+            f"(intraday/stock_analysis_{normalized_stock_code}_*.md)"
+        )
+        logger.error(error_message)
+        return False, stdout, error_message
 
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            cwd=PROJECT_ROOT,
-        )
+        with open(report_path, "r", encoding="utf-8") as file_obj:
+            report_content = file_obj.read()
+    except Exception as exc:
+        error_message = f"讀取個股分析報告失敗: {report_path}, error: {exc}"
+        logger.error(error_message)
+        return False, stdout, error_message
 
-        if result.returncode == 0:
-            return True, result.stdout, result.stderr
-
-        logger.error(f"個股分析失敗 ({stock_code}): {result.stderr[:200]}")
-        return False, result.stdout, result.stderr
-    except subprocess.TimeoutExpired:
-        logger.error(f"個股分析超時 ({stock_code})")
-        return False, "", "Timeout"
-    except Exception as e:
-        logger.error(f"個股分析異常 ({stock_code}): {e}")
-        return False, "", str(e)
+    return True, report_content, stderr
 
 
 def find_latest_news_report(target_date=None):

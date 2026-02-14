@@ -8,20 +8,20 @@ services:
     restart: unless-stopped
     working_dir: /app
     environment:
-      CLAUDE_HOME_TGZ_B64: ${CLAUDE_AUTH_TGZ_B64:-}
-      CODEX_HOME_TGZ_B64: ${CODEX_AUTH_TGZ_B64:-}
       TZ: ${TZ:-Asia/Taipei}
     # 2026-02-13 調整方式: 保留互動式終端，方便 docker exec -it 進入容器操作。
     stdin_open: true
     tty: true
-    command: ["python", "-u", "scheduler/main.py"]
     volumes:
       # 2026-02-13 調整方式: 以 named volumes 取代 host bind，改為容器內部管理資料。
       - scheduler_logs:/app/logs
       - scheduler_outputs:/app/outputs
       - scheduler_strategy:/app/strategy
+      # 2026-02-14 調整方式: 新增盤中個股報告目錄，固定輸出到專案根目錄 intraday/。
+      - scheduler_intraday:/app/intraday
 
 volumes:
   scheduler_logs:
   scheduler_outputs:
   scheduler_strategy:
+  scheduler_intraday:
