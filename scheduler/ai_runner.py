@@ -20,6 +20,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 STRATEGY_DIR = os.path.join(PROJECT_ROOT, "strategy")
 OUTPUTS_DIR = os.path.join(PROJECT_ROOT, "outputs")
 INTRADAY_DIR = os.path.join(PROJECT_ROOT, "intraday")
+CURRENT_HOLDINGS_FILE = os.path.join(OUTPUTS_DIR, "current_holdings.json")
 
 DEFAULT_ALLOWED_TOOLS = "Bash,Read,Write,Glob,Grep,WebSearch,WebFetch"
 
@@ -421,6 +422,69 @@ def _find_recent_output(glob_pattern, started_at):
     return candidates[-1]
 
 
+def _load_current_holdings_positions():
+    if not os.path.exists(CURRENT_HOLDINGS_FILE):
+        return []
+
+    try:
+        with open(CURRENT_HOLDINGS_FILE, "r", encoding="utf-8") as file_obj:
+            payload = json.load(file_obj)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning(f"讀取 current_holdings 失敗，改用 config.holdings: {exc}")
+        return []
+
+    if not isinstance(payload, dict):
+        return []
+
+    positions = payload.get("positions", [])
+    if not isinstance(positions, list):
+        return []
+
+    normalized_positions = []
+    for position in positions:
+        if not isinstance(position, dict):
+            continue
+
+        stock_code = str(position.get("stock_code", "")).strip()
+        if not stock_code:
+            continue
+
+        try:
+            quantity = int(float(position.get("quantity", 0)))
+            avg_price = float(position.get("avg_price", 0))
+        except (TypeError, ValueError):
+            continue
+
+        if quantity <= 0:
+            continue
+
+        normalized_positions.append(
+            {
+                "stock_code": stock_code,
+                "quantity": quantity,
+                "avg_price": avg_price,
+            }
+        )
+
+    return normalized_positions
+
+
+def _build_holdings_text(positions, fallback_holdings):
+    if positions:
+        formatted_items = []
+        for position in positions:
+            formatted_items.append(
+                f"{position['stock_code']}({position['quantity']}股, 均價{position['avg_price']:.2f})"
+            )
+        return "、".join(formatted_items)
+
+    fallback_list = fallback_holdings if isinstance(fallback_holdings, list) else []
+    normalized_holdings = [
+        str(item).strip() for item in fallback_list if str(item).strip()
+    ]
+    return "、".join(normalized_holdings) if normalized_holdings else "無"
+
+
 def run_ai_task(task_name, prompt, config, timeout_minutes):
     """
     執行 AI 任務（單一 provider，不跨 provider fallback）
@@ -533,9 +597,11 @@ def run_tw_stock_analyzer(config, preferences):
     trading_period = preferences.get("trading_period", "short")
     holdings = preferences.get("holdings", [])
     focus_sectors = preferences.get("focus_sectors", [])
+    # 2026-02-14 調整方式: daily 任務優先使用 outputs/current_holdings.json 持股資料。
+    current_positions = _load_current_holdings_positions()
 
     capital_wan = capital / 10000
-    holdings_str = "、".join(holdings) if holdings else "無"
+    holdings_str = _build_holdings_text(current_positions, holdings)
     sectors_str = "、".join(focus_sectors) if focus_sectors else "不限"
 
     prompt = (
@@ -625,7 +691,7 @@ def _parse_multi_stock_stdout(raw_text):
     first_brace_index = raw_text.find("{")
     last_brace_index = raw_text.rfind("}")
     if first_brace_index >= 0 and last_brace_index > first_brace_index:
-        candidates.append(raw_text[first_brace_index:last_brace_index + 1].strip())
+        candidates.append(raw_text[first_brace_index : last_brace_index + 1].strip())
 
     for candidate in candidates:
         try:

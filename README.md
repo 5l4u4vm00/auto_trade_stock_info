@@ -169,6 +169,25 @@ python3 scheduler/main.py --test-job daily
 python3 scheduler/main.py --test-job monitor
 ```
 
+### 手動執行 Mail 交易解析（新增）
+
+```bash
+python3 .codex/skills/mail-trade-recorder/scripts/scan_mail_trades.py \
+  --subject-keyword "交易訊號"
+```
+
+可用環境變數：
+
+- `MAIL_IMAP_HOST`
+- `MAIL_IMAP_PORT`（預設 993）
+- `MAIL_IMAP_USER`
+- `MAIL_IMAP_SECRET`
+
+執行後會產生：
+
+- `outputs/mail_trade_records.csv`（交易歷史）
+- `outputs/current_holdings.json`（目前持股，含數量與均價）
+
 ## 預設排程（可於 config.yaml 修改）
 
 - Job 1（新聞選股）：週日 `00:00`
@@ -182,6 +201,12 @@ python3 scheduler/main.py --test-job monitor
 - 新聞策略：`strategy/news_strategy_*.md`
 - 交易計畫：`outputs/trading_plan_*.md`
 - 盤中個股報告：`intraday/stock_analysis_{股票代號}_{YYYYMMDD}.md`
+- Mail 交易歷史：`outputs/mail_trade_records.csv`
+- 目前持股：`outputs/current_holdings.json`
+
+2026-02-14 調整方式：`daily` 任務在產生交易計畫前，會優先讀取
+`outputs/current_holdings.json` 的持股資料；若檔案不存在或格式錯誤，
+才 fallback 到 `scheduler/config.yaml` 的 `trading_preferences.holdings`。
 
 盤中個股報告 YAML frontmatter 契約欄位：
 

@@ -1,9 +1,9 @@
 email:
   smtp_host: "smtp.gmail.com"
   smtp_port: 587
-  sender: "your_email@gmail.com"
-  password: "app_password_here" # Gmail 應用程式密碼
-  recipient: "target@example.com"
+  sender: "autostockinfo86@gmail.com"
+  password: "kolf bebv loyy wwbk" # Gmail 應用程式密碼
+  recipient: "ariesaries951@gmail.com"
 
 ai:
   provider: "codex" # claude / codex
@@ -26,19 +26,17 @@ ai:
     command_template: "codex exec -m gpt-5.3-codex --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check"
     mode: "stdin" # argv / stdin（codex 建議用 stdin 傳 prompt）
     shell: true
-  # 2026-02-13 調整方式: 新增 skill 強制模式，缺少必要 skill 時任務直接失敗。
   skill_enforcement:
     enabled: true
     mode: "strict" # strict / warn
-    repo_skill_roots:
-      - ".claude/skills"
-      - ".codex/skills"
     task_skill_map:
       news: "news-stock-picker"
       daily: "tw-stock-analyzer"
-      # 2026-02-14 調整方式: monitor 盤中任務改由 multi-stock-analyzer 批次分析。
       monitor: "multi-stock-analyzer"
       monitor_single: "single-stock-analyzer"
+    repo_skill_roots:
+      - ".claude/skills"
+      - ".codex/skills"
     provider_home_map:
       claude: "/root/.claude/skills"
       codex: "/root/.codex/skills"
@@ -46,6 +44,8 @@ ai:
 trading_preferences:
   risk_level: "moderate" # aggressive / moderate / conservative
   capital: 200000 # 可用資金（台幣）
+  monitor_buy_ratio: 0.2 # 盤中 buy 訊號建議買入比例（可用資金）
+  monitor_sell_ratio: 0.3 # 盤中 sell 訊號建議賣出比例（持倉數量）
   trading_period: "short" # day_trade / short / swing
   holdings: [] # 目前持股，例如 ["2330", "2317"]
   focus_sectors: [] # 關注產業，例如 ["半導體", "AI"]

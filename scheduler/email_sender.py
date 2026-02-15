@@ -94,6 +94,9 @@ class EmailSender:
                 - signal_type: "buy" 或 "sell"
                 - price: 當前價格
                 - reason: 觸發原因
+                - suggested_quantity: 建議數量（股）
+                - quantity_unit: 數量單位（股）
+                - quantity_note: 數量計算說明
         """
         if not stocks_info:
             return False
@@ -111,18 +114,29 @@ class EmailSender:
             lines.append("【買入信號】")
             lines.append("-" * 40)
             for s in buy_alerts:
+                # 2026-02-15 調整方式: 警報信件新增建議買賣數量與計算說明。
+                quantity = s.get('suggested_quantity', 'N/A')
+                quantity_unit = str(s.get('quantity_unit', '股')).strip() or '股'
+                quantity_note = s.get('quantity_note', 'N/A')
                 lines.append(f"  {s['stock_code']} {s['stock_name']}")
                 lines.append(f"  當前價格: {s['price']}")
                 lines.append(f"  觸發原因: {s['reason']}")
+                lines.append(f"  建議數量: {quantity}{quantity_unit}")
+                lines.append(f"  數量說明: {quantity_note}")
                 lines.append("")
 
         if sell_alerts:
             lines.append("【賣出信號】")
             lines.append("-" * 40)
             for s in sell_alerts:
+                quantity = s.get('suggested_quantity', 'N/A')
+                quantity_unit = str(s.get('quantity_unit', '股')).strip() or '股'
+                quantity_note = s.get('quantity_note', 'N/A')
                 lines.append(f"  {s['stock_code']} {s['stock_name']}")
                 lines.append(f"  當前價格: {s['price']}")
                 lines.append(f"  觸發原因: {s['reason']}")
+                lines.append(f"  建議數量: {quantity}{quantity_unit}")
+                lines.append(f"  數量說明: {quantity_note}")
                 lines.append("")
 
         lines.append("=" * 50)
