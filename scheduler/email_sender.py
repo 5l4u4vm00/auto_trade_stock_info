@@ -21,7 +21,7 @@ class EmailSender:
             config: dict with keys: smtp_host, smtp_port, sender, password, recipient
         """
         self.smtp_host = config['smtp_host']
-        self.smtp_port = config['smtp_port']
+        self.smtp_port = int(config['smtp_port'])
         self.sender = config['sender']
         self.password = config['password']
         self.recipient = config['recipient']

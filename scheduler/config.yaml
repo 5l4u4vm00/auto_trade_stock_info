@@ -1,9 +1,9 @@
 email:
-  smtp_host: "smtp.gmail.com"
-  smtp_port: 587
-  sender: "autostockinfo86@gmail.com"
-  password: "kolf bebv loyy wwbk" # Gmail 應用程式密碼
-  recipient: "ariesaries951@gmail.com"
+  smtp_host: "${SMTP_HOST:smtp.gmail.com}"
+  smtp_port: ${SMTP_PORT:587}
+  sender: "${SMTP_SENDER:}"
+  password: "${SMTP_AUTH_SECRET:}" # 建議由環境變數注入
+  recipient: "${SMTP_RECIPIENT:}"
 
 ai:
   provider: "codex" # claude / codex
@@ -44,6 +44,8 @@ ai:
 trading_preferences:
   risk_level: "moderate" # aggressive / moderate / conservative
   capital: 200000 # 可用資金（台幣）
+  max_buy_signals: 5 # 每次輸出最多保留 buy 訊號數量
+  min_buy_confidence: 0.55 # buy 訊號最低信心門檻
   monitor_buy_ratio: 0.2 # 盤中 buy 訊號建議買入比例（可用資金）
   monitor_sell_ratio: 0.3 # 盤中 sell 訊號建議賣出比例（持倉數量）
   trading_period: "short" # day_trade / short / swing
